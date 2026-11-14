@@ -36,6 +36,8 @@ const (
 	DefaultMetricsStalenessThreshold time.Duration = 200 * time.Millisecond
 	// defaultHeadroom is the default burst allowance (0%).
 	defaultHeadroom float64 = 0.0
+	// defaultKVCacheGrowthReserveTokens disables the KV cache growth reserve.
+	defaultKVCacheGrowthReserveTokens int64 = 0
 )
 
 // StalenessPolicy selects how endpoints with missing or stale metrics contribute to pool
@@ -118,6 +120,12 @@ type apiConfig struct {
 	// Defaults to 0.0 (no burst allowed) if unset.
 	Headroom *float64 `json:"headroom,omitempty"`
 
+	// KVCacheGrowthReserveTokens reserves KV cache space, in tokens, for the decode growth of
+	// each in-flight request. See Detector.Saturation for the term it adds to the endpoint score.
+	//
+	// Defaults to 0 (disabled) if unset.
+	KVCacheGrowthReserveTokens *int64 `json:"kvCacheGrowthReserveTokens,omitempty"`
+
 	// InFlightLoadProducerName selects which inflight-load-producer's InFlightLoad
 	// attribute supplies the in-flight request count used for scrape-lag
 	// compensation (see Detector.Saturation). Empty selects the default producer.
@@ -128,12 +136,13 @@ type apiConfig struct {
 
 // Config is the internal, fully-validated configuration used by the detector.
 type Config struct {
-	QueueDepthThreshold       int
-	KVCacheUtilThreshold      float64
-	MetricsStalenessThreshold time.Duration
-	Headroom                  float64
-	StalenessPolicy           StalenessPolicy
-	InFlightLoadProducerName  string
+	QueueDepthThreshold        int
+	KVCacheUtilThreshold       float64
+	MetricsStalenessThreshold  time.Duration
+	Headroom                   float64
+	KVCacheGrowthReserveTokens int64
+	StalenessPolicy            StalenessPolicy
+	InFlightLoadProducerName   string
 }
 
 // buildConfig applies the configuration lifecycle (defaulting and validation) and translates the
@@ -152,12 +161,13 @@ func buildConfig(apiCfg *apiConfig) (*Config, error) {
 	}
 
 	return &Config{
-		QueueDepthThreshold:       *safeCfg.QueueDepthThreshold,
-		KVCacheUtilThreshold:      *safeCfg.KVCacheUtilThreshold,
-		MetricsStalenessThreshold: safeCfg.MetricsStalenessThreshold.Duration,
-		Headroom:                  *safeCfg.Headroom,
-		StalenessPolicy:           *safeCfg.StalenessPolicy,
-		InFlightLoadProducerName:  safeCfg.InFlightLoadProducerName,
+		QueueDepthThreshold:        *safeCfg.QueueDepthThreshold,
+		KVCacheUtilThreshold:       *safeCfg.KVCacheUtilThreshold,
+		MetricsStalenessThreshold:  safeCfg.MetricsStalenessThreshold.Duration,
+		Headroom:                   *safeCfg.Headroom,
+		KVCacheGrowthReserveTokens: *safeCfg.KVCacheGrowthReserveTokens,
+		StalenessPolicy:            *safeCfg.StalenessPolicy,
+		InFlightLoadProducerName:   safeCfg.InFlightLoadProducerName,
 	}, nil
 }
 
@@ -174,6 +184,9 @@ func applyDefaults(cfg *apiConfig) {
 	}
 	if cfg.Headroom == nil {
 		cfg.Headroom = ptr.To(defaultHeadroom)
+	}
+	if cfg.KVCacheGrowthReserveTokens == nil {
+		cfg.KVCacheGrowthReserveTokens = ptr.To(defaultKVCacheGrowthReserveTokens)
 	}
 	if cfg.StalenessPolicy == nil {
 		cfg.StalenessPolicy = ptr.To(StalenessSaturated)
@@ -197,6 +210,10 @@ func validateConfig(cfg *apiConfig) error {
 	}
 	if cfg.Headroom != nil && *cfg.Headroom < 0.0 {
 		errs = append(errs, fmt.Errorf("headroom must be a non-negative value, got %f", *cfg.Headroom))
+	}
+	if cfg.KVCacheGrowthReserveTokens != nil && *cfg.KVCacheGrowthReserveTokens < 0 {
+		errs = append(errs, fmt.Errorf("kvCacheGrowthReserveTokens must be a non-negative value, got %d",
+			*cfg.KVCacheGrowthReserveTokens))
 	}
 	if cfg.StalenessPolicy != nil && *cfg.StalenessPolicy != StalenessSaturated &&
 		*cfg.StalenessPolicy != StalenessIgnore {

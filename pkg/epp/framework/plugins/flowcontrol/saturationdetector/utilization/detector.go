@@ -109,7 +109,8 @@ func NewDetector(name string, cfg Config, logger logr.Logger) *Detector {
 		"kvCacheUtilThreshold", cfg.KVCacheUtilThreshold,
 		"metricsStalenessThreshold", cfg.MetricsStalenessThreshold.String(),
 		"stalenessPolicy", cfg.StalenessPolicy,
-		"headroom", cfg.Headroom)
+		"headroom", cfg.Headroom,
+		"kvCacheGrowthReserveTokens", cfg.KVCacheGrowthReserveTokens)
 
 	if cfg.Headroom > 1.0 {
 		pluginLogger.Info("Unusually high headroom configured; verify value is a fraction, not a percentage",
@@ -126,27 +127,61 @@ func NewDetector(name string, cfg Config, logger logr.Logger) *Detector {
 }
 
 // Consumes declares InFlightLoad as an optional dependency: it supplies the
-// scrape-lag compensation in Saturation and Filter, but the detector still functions on
-// scraped metrics alone when no inflight-load-producer is configured.
+// scrape-lag compensation and the booked tokens of the KV cache growth reserve in Saturation
+// and Filter, but the detector still functions on scraped metrics alone when no
+// inflight-load-producer is configured.
 func (d *Detector) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
 		Optional: map[fwkplugin.DataKey]any{d.inFlightLoadDataKey: attrconcurrency.InFlightLoad{}},
 	}
 }
 
-// queueDepth returns the scraped waiting queue plus the in-flight requests the
-// scrape does not yet reflect (see Saturation).
-func (d *Detector) queueDepth(m *datalayer.Metrics, attrs datalayer.AttributeMap) int64 {
-	waiting := int64(m.WaitingQueueSize)
+// inFlightLoad returns the endpoint's InFlightLoad attribute, or nil when it is absent.
+func (d *Detector) inFlightLoad(attrs datalayer.AttributeMap) *attrconcurrency.InFlightLoad {
 	if attrs == nil {
-		return waiting
+		return nil
 	}
 	if val, ok := attrs.Get(d.inFlightLoadDataKey); ok {
 		if load, ok := val.(*attrconcurrency.InFlightLoad); ok {
-			return waiting + max(0, load.Requests-waiting-int64(m.RunningRequestsSize))
+			return load
 		}
 	}
-	return waiting
+	return nil
+}
+
+// queueDepth returns the scraped waiting queue plus the in-flight requests the
+// scrape does not yet reflect (see Saturation).
+func (d *Detector) queueDepth(m *datalayer.Metrics, load *attrconcurrency.InFlightLoad) int64 {
+	waiting := int64(m.WaitingQueueSize)
+	if load == nil {
+		return waiting
+	}
+	return waiting + max(0, load.Requests-waiting-int64(m.RunningRequestsSize))
+}
+
+// growthReserveRatio returns the share of the endpoint's KV cache taken by its measured usage,
+// the booked tokens of in-flight requests, and the growth reserve (see Saturation). It returns 0
+// when the reserve is disabled, the cache size is not reported, or the endpoint has no requests.
+func (d *Detector) growthReserveRatio(
+	m *datalayer.Metrics,
+	load *attrconcurrency.InFlightLoad,
+	depth int64,
+) float64 {
+	reserve := d.config.KVCacheGrowthReserveTokens
+	if reserve <= 0 || m.CacheBlockSize <= 0 || m.CacheNumBlocks <= 0 {
+		return 0
+	}
+	requests := int64(m.RunningRequestsSize) + depth
+	if requests == 0 {
+		return 0
+	}
+	var pending int64
+	if load != nil {
+		pending = load.Tokens
+	}
+	capacity := float64(m.CacheBlockSize) * float64(m.CacheNumBlocks)
+	// Float arithmetic: the product overflows int64 for a large reserve.
+	return m.KVCacheUsagePercent + (float64(pending)+float64(requests+1)*float64(reserve))/capacity
 }
 
 // TypedName returns the type and name tuple of this plugin instance.
@@ -181,10 +216,26 @@ func (d *Detector) TypedName() fwkplugin.TypedName {
 //	credit = max(0, InFlightRequests - (WaitingQueueSize + RunningRequestsSize))
 //
 // The credit corrects each endpoint's score before aggregation. It is added
-// only to the queue-depth term (the fast, controllable signal); the KV-cache
-// term is left as measured. Endpoints without the attribute contribute zero
+// to the queue-depth term (the fast, controllable signal) and to the request
+// count of the KV cache growth reserve; the KV-cache threshold term is left as
+// measured. Endpoints without the attribute contribute zero
 // credit and fall back to the scraped queue depth. See the package README for
 // the assumptions the compensation rests on.
+//
+// # KV cache growth reserve
+//
+// A request admitted below the KV-cache threshold keeps allocating cache while it decodes. When
+// KVCacheGrowthReserveTokens is set, the pod score is also bounded below by the share of the
+// cache that is used, booked, or reserved for that growth:
+//
+//	Requests = RunningRequestsSize + WaitingQueueSize + credit
+//	ReserveScore = KVCacheUsage + (BookedTokens + (Requests + 1) * Reserve) / CacheTokens
+//
+// CacheTokens is CacheBlockSize * CacheNumBlocks, BookedTokens is the InFlightLoad token count
+// (0 without the attribute), and the extra reserve is for the request the gate is about to
+// admit. The term is skipped for an endpoint that does not report its cache size or has no
+// requests: an idle endpoint is the best placement the pool can offer, whatever the reserve.
+// See the package README for the assumptions the reserve rests on.
 func (d *Detector) Saturation(ctx context.Context, candidates []datalayer.Endpoint) float64 {
 	stage := flowcontrol.SaturationStageFromContext(ctx)
 	if len(candidates) == 0 {
@@ -213,11 +264,13 @@ func (d *Detector) Saturation(ctx context.Context, candidates []datalayer.Endpoi
 			continue
 		}
 
-		qRatio := float64(d.queueDepth(podMetrics, e.GetAttributes())) / float64(d.config.QueueDepthThreshold)
+		load := d.inFlightLoad(e.GetAttributes())
+		depth := d.queueDepth(podMetrics, load)
+		qRatio := float64(depth) / float64(d.config.QueueDepthThreshold)
 		kvRatio := podMetrics.KVCacheUsagePercent / d.config.KVCacheUtilThreshold
 
 		// Roofline Analysis: The pod is saturated if either resource is exhausted.
-		totalScore += max(qRatio, kvRatio)
+		totalScore += max(qRatio, kvRatio, d.growthReserveRatio(podMetrics, load, depth))
 	}
 
 	metrics.RecordFlowControlStaleEndpoints(d.typedName.Name, stage, staleCount)
@@ -261,7 +314,8 @@ func (d *Detector) maybeLogStaleEndpoints(staleCount, total int) {
 //
 // It applies a relaxed limit (Threshold * (1 + Headroom)) to allow for scheduling flexibility and burst tolerance.
 // The KV cache limit is capped at 1.0.
-// The queue depth includes the same scrape-lag compensation as Saturation.
+// The queue depth includes the same scrape-lag compensation as Saturation. Headroom does not relax the
+// KV cache growth reserve, whose limit is the physical cache size.
 func (d *Detector) Filter(
 	_ context.Context,
 	_ *fwksched.InferenceRequest,
@@ -279,7 +333,10 @@ func (d *Detector) Filter(
 			continue
 		}
 
-		if float64(d.queueDepth(podMetrics, endpoint)) < qLimit && podMetrics.KVCacheUsagePercent < kvLimit {
+		load := d.inFlightLoad(endpoint)
+		depth := d.queueDepth(podMetrics, load)
+		if float64(depth) < qLimit && podMetrics.KVCacheUsagePercent < kvLimit &&
+			d.growthReserveRatio(podMetrics, load, depth) < 1.0 {
 			filtered = append(filtered, endpoint)
 		}
 	}

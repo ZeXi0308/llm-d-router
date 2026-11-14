@@ -19,6 +19,7 @@ package utilization
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -132,6 +134,16 @@ func TestUtilizationDetectorFactory(t *testing.T) {
 		{
 			name:       "invalid staleness policy",
 			configJSON: []byte(`{"stalenessPolicy": "bogus"}`),
+			wantError:  true,
+		},
+		{
+			name:       "valid KV cache growth reserve",
+			configJSON: []byte(`{"kvCacheGrowthReserveTokens": 1850}`),
+			wantError:  false,
+		},
+		{
+			name:       "invalid KV cache growth reserve",
+			configJSON: []byte(`{"kvCacheGrowthReserveTokens": -1}`),
 			wantError:  true,
 		},
 	}
@@ -446,6 +458,185 @@ func TestDetector_Saturation_ScrapeLagCredit(t *testing.T) {
 		"only unobserved in-flight credited, running not double-counted")
 }
 
+// makeKVCacheMetrics returns a fresh metrics snapshot for an endpoint whose KV cache holds
+// blockSize * numBlocks tokens.
+func makeKVCacheMetrics(waiting, running int, kvUsage float64, blockSize, numBlocks int) *fwkdl.Metrics {
+	metrics := fwkdl.NewMetrics()
+	metrics.WaitingQueueSize = waiting
+	metrics.RunningRequestsSize = running
+	metrics.KVCacheUsagePercent = kvUsage
+	metrics.CacheBlockSize = blockSize
+	metrics.CacheNumBlocks = numBlocks
+	metrics.UpdateTime = time.Now()
+	return metrics
+}
+
+func TestDetector_Saturation_KVCacheGrowthReserve(t *testing.T) {
+	t.Parallel()
+
+	// pod builds a fresh endpoint with a KV cache of 16 * 1000 = 16000 tokens.
+	pod := func(waiting, running int, kvUsage float64) fwkdl.Endpoint {
+		return fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+			ID: types.NamespacedName{Name: "pod1", Namespace: "ns1"},
+		}, makeKVCacheMetrics(waiting, running, kvUsage, 16, 1000))
+	}
+	// podWithCache is pod with a settable cache size.
+	podWithCache := func(blockSize, numBlocks int) fwkdl.Endpoint {
+		return fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+			ID: types.NamespacedName{Name: "pod1", Namespace: "ns1"},
+		}, makeKVCacheMetrics(0, 7, 0.5, blockSize, numBlocks))
+	}
+	// withLoad attaches the request count and booked tokens of an inflight-load-producer.
+	withLoad := func(e fwkdl.Endpoint, requests, tokens int64) fwkdl.Endpoint {
+		e.GetAttributes().Put(attrconcurrency.InFlightLoadDataKey,
+			&attrconcurrency.InFlightLoad{Requests: requests, Tokens: tokens})
+		return e
+	}
+
+	// Config: Queue=5, KV=0.8. The reserve is set per case.
+	tests := []struct {
+		name           string
+		reserve        int64
+		pods           []fwkdl.Endpoint
+		wantSaturation float64
+	}{
+		{
+			name:    "Reserve for the running requests and one more fills the cache",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// Q=0/5 (0.0). KV=0.5/0.8 (0.625). Reserve=0.5+(7+1)*1000/16000 (1.0).
+				pod(0, 7, 0.5),
+			},
+			wantSaturation: 1.0,
+		},
+		{
+			name:    "One request fewer leaves room",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// Reserve=0.5+(6+1)*1000/16000 (0.9375).
+				pod(0, 6, 0.5),
+			},
+			wantSaturation: 0.9375,
+		},
+		{
+			name:    "Waiting requests hold a reserve",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// Q=3/5 (0.6). Reserve=0.5+(3+4+1)*1000/16000 (1.0).
+				pod(3, 4, 0.5),
+			},
+			wantSaturation: 1.0,
+		},
+		{
+			name:    "In-flight requests the scrape has not reflected hold a reserve",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// 6 in flight, 2 scraped: credit 4. Q=4/5 (0.8). Reserve=0.5+(2+4+1)*1000/16000 (0.9375).
+				withLoad(pod(0, 2, 0.5), 6, 0),
+			},
+			wantSaturation: 0.9375,
+		},
+		{
+			name:    "Booked prompt tokens count toward the cache",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// Reserve=0.5+(1600+(6+1)*1000)/16000 (1.0375).
+				withLoad(pod(0, 6, 0.5), 6, 1600),
+			},
+			wantSaturation: 1.0375,
+		},
+		{
+			name:    "In-flight requests on an endpoint scraped as idle hold a reserve",
+			reserve: 2000,
+			pods: []fwkdl.Endpoint{
+				// Q=3/5 (0.6). Reserve=0.5+(0+3+1)*2000/16000 (1.0).
+				withLoad(pod(0, 0, 0.5), 3, 0),
+			},
+			wantSaturation: 1.0,
+		},
+		{
+			name:    "Idle endpoint holds no reserve",
+			reserve: 20000,
+			pods: []fwkdl.Endpoint{
+				// KV=0.2/0.8 (0.25). A reserve for one request would be 0.2+20000/16000 (1.45).
+				pod(0, 0, 0.2),
+			},
+			wantSaturation: 0.25,
+		},
+		{
+			name:    "Reserve larger than the cache saturates a busy endpoint",
+			reserve: 20000,
+			pods: []fwkdl.Endpoint{
+				// Reserve=0.1+(1+1)*20000/16000 (2.6).
+				pod(0, 1, 0.1),
+			},
+			wantSaturation: 2.6,
+		},
+		{
+			name:    "Threshold term larger than the reserve term",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// KV=0.9/0.8 (1.125). Reserve=0.9+(1+1)*1000/16000 (1.025).
+				pod(0, 1, 0.9),
+			},
+			wantSaturation: 1.125,
+		},
+		{
+			name:    "Reserve unset",
+			reserve: 0,
+			pods: []fwkdl.Endpoint{
+				// KV=0.5/0.8 (0.625).
+				pod(0, 7, 0.5),
+			},
+			wantSaturation: 0.625,
+		},
+		{
+			name:    "Cache block size not reported",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// KV=0.5/0.8 (0.625).
+				podWithCache(0, 1000),
+			},
+			wantSaturation: 0.625,
+		},
+		{
+			name:    "Cache block count not reported",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// KV=0.5/0.8 (0.625).
+				podWithCache(16, 0),
+			},
+			wantSaturation: 0.625,
+		},
+		{
+			name:    "Multiple pods, one full, one with room",
+			reserve: 1000,
+			pods: []fwkdl.Endpoint{
+				// Pod1: Reserve=1.0.
+				pod(0, 7, 0.5),
+				// Pod2: Reserve=0.9375.
+				pod(0, 6, 0.5),
+			},
+			// Avg(1.0, 0.9375) = 0.96875
+			wantSaturation: 0.96875,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			detector := NewDetector("test-detector", Config{
+				QueueDepthThreshold:        5,
+				KVCacheUtilThreshold:       0.8,
+				MetricsStalenessThreshold:  time.Hour,
+				KVCacheGrowthReserveTokens: tc.reserve,
+			}, logr.Discard())
+
+			got := detector.Saturation(context.Background(), tc.pods)
+			require.InDelta(t, tc.wantSaturation, got, 1e-4, "Saturation mismatch")
+		})
+	}
+}
+
 func TestDetector_Filter(t *testing.T) {
 	t.Parallel()
 
@@ -758,6 +949,126 @@ func TestUtilizationDetectorFactory_StalenessWarning(t *testing.T) {
 			_, err := UtilizationDetectorFactory("test", nil, handle)
 			require.NoError(t, err)
 			require.Equal(t, tc.wantWarnings, sink.warnings)
+		})
+	}
+}
+
+func TestBuildConfig_KVCacheGrowthReserve(t *testing.T) {
+	t.Parallel()
+
+	set, err := buildConfig(&apiConfig{KVCacheGrowthReserveTokens: ptr.To(int64(1850))})
+	require.NoError(t, err)
+	require.Equal(t, int64(1850), set.KVCacheGrowthReserveTokens)
+
+	unset, err := buildConfig(&apiConfig{})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), unset.KVCacheGrowthReserveTokens)
+}
+
+func TestDetector_Filter_KVCacheGrowthReserve(t *testing.T) {
+	t.Parallel()
+
+	// Each endpoint's KV cache holds 16 * 1000 tokens.
+	pod := func(name string, running int, kvUsage float64) fwksched.Endpoint {
+		meta := &fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: name, Namespace: "ns1"}}
+		return fwksched.NewEndpoint(meta, makeKVCacheMetrics(0, running, kvUsage, 16, 1000), nil)
+	}
+	podWithoutCacheSize := func(name string, running int, kvUsage float64) fwksched.Endpoint {
+		meta := &fwkdl.EndpointMetadata{ID: types.NamespacedName{Name: name, Namespace: "ns1"}}
+		return fwksched.NewEndpoint(meta, makeKVCacheMetrics(0, running, kvUsage, 0, 0), nil)
+	}
+	withTokens := func(e fwksched.Endpoint, requests, tokens int64) fwksched.Endpoint {
+		e.Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{Requests: requests, Tokens: tokens})
+		return e
+	}
+
+	tests := []struct {
+		name      string
+		reserve   int64
+		endpoints []fwksched.Endpoint
+		wantNames []string
+	}{
+		{
+			// pod1: 0.5 + 8*1000/16000 = 1.0. pod2: 0.5 + 7*1000/16000 = 0.9375.
+			// Both pass the threshold limits (KV 0.5 < 0.96), so headroom does not relax the reserve.
+			name:      "Endpoint without room for the reserve is dropped",
+			reserve:   1000,
+			endpoints: []fwksched.Endpoint{pod("pod1", 7, 0.5), pod("pod2", 6, 0.5)},
+			wantNames: []string{"pod2"},
+		},
+		{
+			// pod1: 0.5 + (1600 + 7*1000)/16000 = 1.0375. pod2: 0.5 + (800 + 7*1000)/16000 = 0.9875.
+			name:    "Booked prompt tokens count toward the cache",
+			reserve: 1000,
+			endpoints: []fwksched.Endpoint{
+				withTokens(pod("pod1", 6, 0.5), 6, 1600),
+				withTokens(pod("pod2", 6, 0.5), 6, 800),
+			},
+			wantNames: []string{"pod2"},
+		},
+		{
+			// pod1: scraped 2 running, 6 in flight, credit 4: 0.5 + (2 + 4 + 1) * 1000 / 16000 = 0.9375.
+			// pod2: scraped 2 running, 7 in flight, credit 5: 0.5 + (2 + 5 + 1) * 1000 / 16000 = 1.0.
+			// Both credits are under the queue limit of 6.
+			name:    "In-flight requests the scrape has not reflected hold a reserve",
+			reserve: 1000,
+			endpoints: []fwksched.Endpoint{
+				withTokens(pod("pod1", 2, 0.5), 6, 0),
+				withTokens(pod("pod2", 2, 0.5), 7, 0),
+			},
+			wantNames: []string{"pod1"},
+		},
+		{
+			name:      "Largest reserve drops a busy endpoint and keeps an idle one",
+			reserve:   math.MaxInt64,
+			endpoints: []fwksched.Endpoint{pod("pod1", 0, 0.2), pod("pod2", 1, 0.1)},
+			wantNames: []string{"pod1"},
+		},
+		{
+			name:      "All endpoints without room fail open",
+			reserve:   1000,
+			endpoints: []fwksched.Endpoint{pod("pod1", 7, 0.5), pod("pod2", 8, 0.5)},
+			wantNames: []string{"pod1", "pod2"},
+		},
+		{
+			// pod1 is idle and holds no reserve. pod2: 0.1 + 2*20000/16000 = 2.6.
+			name:      "Idle endpoint passes a reserve larger than the cache",
+			reserve:   20000,
+			endpoints: []fwksched.Endpoint{pod("pod1", 0, 0.2), pod("pod2", 1, 0.1)},
+			wantNames: []string{"pod1"},
+		},
+		{
+			name:      "Endpoint that does not report its cache size is kept",
+			reserve:   1000,
+			endpoints: []fwksched.Endpoint{podWithoutCacheSize("pod1", 7, 0.5), pod("pod2", 7, 0.5)},
+			wantNames: []string{"pod1"},
+		},
+		{
+			name:      "Reserve unset",
+			reserve:   0,
+			endpoints: []fwksched.Endpoint{pod("pod1", 7, 0.5), pod("pod2", 6, 0.5)},
+			wantNames: []string{"pod1", "pod2"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			detector := NewDetector("test-detector", Config{
+				QueueDepthThreshold:        5,
+				KVCacheUtilThreshold:       0.8,
+				MetricsStalenessThreshold:  time.Hour,
+				Headroom:                   0.2,
+				KVCacheGrowthReserveTokens: tc.reserve,
+			}, logr.Discard())
+
+			got := detector.Filter(context.Background(), nil, tc.endpoints)
+
+			names := make([]string, 0, len(got))
+			for _, e := range got {
+				names = append(names, e.GetMetadata().ID.Name)
+			}
+			require.Equal(t, tc.wantNames, names, "Filtered endpoints mismatch")
 		})
 	}
 }
